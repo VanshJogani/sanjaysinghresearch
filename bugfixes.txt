@@ -1,0 +1,133 @@
+================================================================================
+2026-04-15 (round 2)
+================================================================================
+
+[engine.py / pipeline.py] Newton step N_total used buffer size instead of total samples seen
+  _influence_newton divides the H^{-1}·grad step by N_total, which was passed as
+  len(buf_y) (~600, the replay buffer size). The correct N is the total number of
+  samples the model has trained on, which grows to ~16000 by batch 80. Using 600
+  instead made every Newton step ~26x too large, causing systematic accuracy
+  collapse from 0.90 to 0.69 and 16/29 utility-drop rollbacks.
+  Fix: track n_seen in the pipeline and pass it as n_total to unlearn(); fall back
+  to len(y_train) if not provided.
+
+[engine.py] No magnitude cap on Newton step allowed arbitrarily large weight updates
+  Even with correct N_total, a poorly conditioned Hessian can produce a step that
+  is large in L2 norm, destabilising the model on the first few batches when N is
+  still small.
+  Fix: clip the step vector to L2 norm <= 0.1 before applying it.
+
+[preservation.py] EWC recovery used too few steps to undo oversized Newton updates
+  check_and_recover ran only 10 EWC gradient steps, which was insufficient to
+  recover accuracy when the Newton step had perturbed weights significantly.
+  Fix: increase recovery steps from 10 to 25.
+
+================================================================================
+2026-04-15 (round 6)
+================================================================================
+
+[engine.py] LiSSA HVP in _influence_newton used only candidate samples (15) not full training data
+  The Newton step's LiSSA loop estimated the Hessian-vector product using X_cand
+  (15 candidate samples), not the full replay buffer (~600 samples). With only 15
+  samples the HVP was extremely noisy — the resulting direction was sometimes right
+  (batch 35: SPD 0.2391→0.2132) but usually garbage (batches 49, 56, 63: identical
+  before/after). The InfluenceEstimator._lissa() correctly uses buf_X/buf_y for HVP;
+  _influence_newton was inconsistent with this.
+  Fix: add X_ref/y_ref parameters to _influence_newton and pass X_train/y_train
+  (the full replay buffer) for HVP. X_cand/y_cand are still used only for grad_sum.
+
+
+
+[engine.py] Fixed Newton step clip caused by constant max_norm (too small or too large)
+  clip=0.05 was too small to flip enough window predictions to visibly change SPD
+  (many events showed SPD before = SPD after to 4 decimal places). clip=0.10 (from
+  round 3) was too large and caused accuracy collapse. A constant clip cannot be
+  right for all stages of the run: when SPD=0.30, an aggressive step is justified;
+  when SPD=0.12 (near threshold), a tiny step is needed to avoid overshooting.
+  Fix: make max_step_norm adaptive — computed as clip(0.5 * spd_excess, 0.02, 0.10)
+  where spd_excess = max(0, snapshot.spd - threshold). Pass from pipeline to
+  unlearn() and down to _influence_newton() via a new max_step_norm parameter.
+
+[pipeline.py] Fine-tuning 5 steps washing out fairness gain
+  5 steps of fine-tuning on the biased replay buffer re-introduced approximately
+  as much bias as the Newton step removed, leaving many events with zero net SPD
+  change. Reduced to 2 steps: enough for partial accuracy recovery without
+  completely cancelling the Newton step's fairness correction.
+
+[compas_demo.py] consecutive_violations too low (5) triggered too many events
+  With structural COMPAS bias, SPD exceeds the threshold almost every batch.
+  consecutive_violations=5 produced 17-19 unlearning events, causing cumulative
+  accuracy drift even when individual drops were within tolerance.
+  Fix: raise to 7 to reduce event frequency.
+
+[compas_demo.py] accuracy_drop_tolerance too tight at 0.04
+  With adaptive (smaller) steps near the threshold, the 0.04 tolerance rejected
+  events that were making genuine small improvements.
+  Fix: raise to 0.06 to match the wider range of step sizes now in use.
+
+
+
+[pipeline.py] Cumulative accuracy drift from compounding per-event tolerance
+  Each accepted unlearning event was allowed to drop accuracy by up to 0.08.
+  With 13 accepted events, this compounds: 0.88 * (1-0.05)^13 ≈ 0.50, matching
+  the observed collapse to 0.51 at batch 76. The utility check only prevented
+  single-event drops, not cumulative drift across the run.
+  Fix: after every accepted unlearning, immediately call preserver.fine_tune()
+  for 5 steps on the replay buffer to recover accuracy before the next batch.
+
+[engine.py] Newton step clip too large, causing excessive per-event accuracy cost
+  The L2-norm clip at 0.1 allowed steps large enough that each event traded
+  significant accuracy for fairness gain. Over many events this compounded.
+  Fix: tighten clip from 0.1 to 0.05, halving the per-event weight perturbation.
+
+[compas_demo.py] accuracy_drop_tolerance too loose at 0.08
+  An 8% per-event accuracy drop acceptance threshold is too permissive when
+  many unlearning events fire, since small drops compound across the run.
+  Fix: tighten to 0.04 to reject events where the Newton step costs too much
+  accuracy even before fine-tuning recovery.
+
+
+
+[engine.py] 1/N_total scaling made Newton steps negligibly small (opposite problem)
+  Using n_seen (~16000) as N_total made the step v/16000 ≈ 0.000006 — far below
+  the 0.1 clip, so the clip never fired and SPD before/after were identical to 4
+  decimal places on most events (e.g. 0.2485->0.2485). The prior fix traded
+  accuracy collapse for a completely inert unlearner.
+  Root cause: 1/N scaling is mathematically correct for influence functions but
+  practically useless for fairness unlearning — removing 15/16000 points (~0.1%
+  of training data) has a negligible parameter effect by design.
+  Fix: remove the 1/N_total division entirely. The L2-norm clip at 0.1 is the
+  right and only guard against accuracy collapse. Also removed n_total parameter
+  plumbing from unlearn() and pipeline since it is no longer used.
+
+
+
+[pipeline.py] Fairness check after unlearning used a bare single-batch SPD
+  Post-unlearning `new_snapshot` was computed from a fresh FairnessMonitor fed
+  only the current 200-sample batch. SPD over 200 samples is high-variance,
+  causing good unlearning events to be falsely rejected as "fairness worsened".
+  Fix: copy the existing rolling window history into temp_monitor and only
+  replace the most-recent batch slice with fresh predictions, making the
+  comparison apples-to-apples with `snapshot`. Tolerance tightened 0.05 -> 0.02.
+
+[engine.py] LiSSA iteration diverging in _influence_newton
+  Update rule `v = grad_sum + v - hvp` with `hvp = (H + λI)·v` expands to
+  `v = grad_sum + (I - H - λI)·v`. Convergence requires spectral radius of
+  (I - H_d) < 1, which fails for large Hessian eigenvalues. Without normalising
+  grad_sum first, v blew up and produced wild Newton steps (e.g. SPD 0.29->0.40).
+  Fix: normalise grad_sum before the iteration and undo the scale afterwards;
+  increased iterations from 5 to 10.
+
+[pipeline.py] Model skipped training on accepted-unlearning batches
+  After a successful unlearning + detector.reset(), the pipeline jumped straight
+  to replay_buffer.add(batch) without calling model.update(batch.X, batch.y).
+  Over 15 accepted events that silently dropped ~3000 training samples.
+  Fix: call self.model.update(batch.X, batch.y) after accepting unlearning.
+
+[pipeline.py] Retain set overlapped with forget candidates in unlearning
+  rep_X/rep_y for the gradient reversal retain signal was sampled from the whole
+  replay buffer, including the candidate indices being unlearned. The "forget"
+  gradient was being immediately counteracted by the "retain" gradient on the
+  same points.
+  Fix: build retain_mask excluding cand_idx before sampling the retain set.
+

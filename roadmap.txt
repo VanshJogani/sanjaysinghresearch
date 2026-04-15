@@ -1,0 +1,576 @@
+================================================================================
+AFU RESEARCH ROADMAP — TOP-TIER PUBLICATION PATH (6-12 MONTHS)
+================================================================================
+
+TARGET VENUES
+--------------
+  Primary  : NeurIPS 2026 / ICML 2026
+  Secondary: ICLR 2026 (fairness track)
+  Fallback : JMLR, IEEE TKDE (Q1 journals, longer review cycle)
+
+  NeurIPS abstract deadline: typically late May
+  ICML submission: typically late January
+  Rule: have a full draft 8 weeks before target deadline
+
+================================================================================
+PHASE 1 — THEORETICAL FOUNDATION  (Months 1-3)
+================================================================================
+
+Most important phase. Without proofs you have a workshop paper.
+
+------------------------------------------------------------
+1.1  Formalize the Problem (Week 1-2)
+------------------------------------------------------------
+Write the formal problem statement before writing any more code.
+
+  Define:
+    S = {(x_t, y_t, a_t)}        data stream, a_t is protected attribute
+    theta_t                        model parameters at batch t
+    F(theta_t; W_t) <= tau         fairness constraint on sliding window W_t
+    U subset W_t                   harmful points to remove
+    L_task(theta_new) <= L_task(theta_old) + eps_acc   utility constraint
+
+  This framing lets you state the main theorem before proving it.
+
+------------------------------------------------------------
+1.2  Certified Unlearning Bound (Week 2-5)
+------------------------------------------------------------
+Your strongest theoretical contribution.
+
+  Goal: Prove Newton-step unlearning achieves (eps, delta)-certified
+  unlearning in the streaming convex setting.
+
+  Key result to prove:
+    ||theta_unlearn - theta_retrain||_2 <= O(|U| / (n * lambda_min(H)))
+
+  where:
+    |U|            = number of unlearned points
+    n              = effective training set size (replay buffer)
+    lambda_min(H)  = smallest eigenvalue of Hessian (condition number)
+
+  Why tractable:
+    For logistic regression H is the empirical Fisher matrix.
+    lambda_min(H) can be bounded if data is sub-Gaussian and replay
+    buffer is drawn i.i.d. from the clean distribution.
+
+  Papers to read first (in order):
+    1. Guo et al. 2020 — "Certified Data Removal from Machine Learning Models"
+    2. Sekhari et al. 2021 — "Remember What You Want to Forget"
+    3. Neel et al. 2021 — "Descent-to-Delete: Gradient-Based Methods for
+       Machine Unlearning"
+
+  Note: your Newton-step already does this approximately. The theoretical
+  work is formalizing what "approximately" means and bounding the error.
+
+------------------------------------------------------------
+1.3  Fairness Recovery Bound (Week 4-7)
+------------------------------------------------------------
+After unlearning U, prove how much fairness improves.
+
+  Key result to prove:
+    E[SPD(theta_new)] <= E[SPD(theta_old)] - Delta_F
+                        + O(|U*|^(1/2) / n^(1/2))
+
+  where U* is the set identified by influence scoring.
+
+  The O(sqrt(|U*|/n)) term is LiSSA approximation error.
+
+  Requires:
+    - Bounding LiSSA approximation error (Koh & Liang 2017, Appendix)
+    - Connecting influence scores to SPD gradient
+    - Sub-Gaussian assumption on features
+
+------------------------------------------------------------
+1.4  CUSUM Detection Delay Bound (Week 6-8)
+------------------------------------------------------------
+Easiest of the four results. CUSUM theory is mature.
+
+  From classical CUSUM theory (Lorden 1971):
+    E[detection delay] = O(log(1/alpha) / Delta^2)
+
+  where alpha = false alarm rate, Delta = SPD shift magnitude.
+
+  Translate to your setting:
+    - Define Delta as SPD change per batch after bias injection
+    - Show your window_size and threshold tau achieve a specific
+      (false alarm rate, detection delay) operating point
+    - This is a ~1 page theoretical result
+
+------------------------------------------------------------
+1.5  Accuracy-Fairness-Unlearning Tradeoff (Week 8-10)
+------------------------------------------------------------
+Prove you cannot simultaneously have all three for free:
+  (a) eps-certified unlearning
+  (b) |SPD| <= tau fairness guarantee
+  (c) accuracy loss <= delta
+
+  This is an impossibility result. Prove a lower bound showing any
+  algorithm satisfying (a) and (b) must incur at least Omega(f(eps,tau))
+  accuracy loss. Then show your method achieves this bound tightly.
+
+  Why this matters: impossibility results are highly valued at NeurIPS/ICML.
+  They tell reviewers what is fundamentally achievable, not just what you did.
+
+================================================================================
+PHASE 2 — NEURAL NETWORK EXTENSION  (Months 2-4, overlaps Phase 1)
+================================================================================
+
+Without neural net support reviewers will reject: "limited to convex models."
+
+------------------------------------------------------------
+2.1  TracIn for Approximate Influence (Week 6-10)
+------------------------------------------------------------
+TracIn (Pruthi et al., NeurIPS 2020) works for any differentiable model:
+
+  TracIn(z, z_test) = sum_t  eta_t * grad_L(z, theta_t) . grad_L(z_test, theta_t)
+
+  where theta_t are saved checkpoints during training.
+
+  Implementation plan:
+    1. Modify attribution/influence.py to support tracin backend
+       alongside existing LiSSA backend
+    2. Add FrameworkConfig flag: influence_method = "lissa" | "tracin"
+    3. Save model checkpoints during streaming loop (every K batches)
+    4. TracIn score = dot product of gradient traces over checkpoints
+
+  This is ~200 lines of code and gives full neural net support.
+
+------------------------------------------------------------
+2.2  MLP Base Model (Week 8-12)
+------------------------------------------------------------
+Replace OnlineLogisticRegression with a small MLP:
+  Architecture: input -> 128 -> ReLU -> 64 -> ReLU -> 1 -> sigmoid
+  Training: mini-batch SGD, same interface as current model
+
+  Key changes in models/base_model.py:
+    - Add MLPModel class with same .predict(), .update(), .gradient() interface
+    - gradient() via manual backprop or autograd
+    - hessian_vector_product() approximated via finite differences
+      OR replaced entirely by TracIn
+
+  Why MLP not LightGBM:
+    MLP is differentiable -> influence functions work
+    LightGBM is not differentiable -> needs completely different approach
+    Keep complexity manageable for first top-tier submission
+
+------------------------------------------------------------
+2.3  Validate Bounds on MLP (Week 12-14)
+------------------------------------------------------------
+Certified unlearning bound from Phase 1.2 assumed convexity.
+For MLP either:
+  (a) Restrict to "nearly convex" regime (small network, strong L2) and
+      prove bound holds approximately, or
+  (b) Report "unlearning gap" ||theta_unlearn - theta_retrain||_2
+      empirically as a metric alongside theoretical bound
+
+  Option (b) is fine for top-tier if you are transparent about it.
+  Frame it as: "Theorem 1 holds exactly for convex models; Table 3 shows
+  the empirical gap remains small (<X) for our MLP setting."
+
+================================================================================
+PHASE 3 — DATASETS AND EXPERIMENTS  (Months 3-6)
+================================================================================
+
+------------------------------------------------------------
+3.1  Dataset Plan
+------------------------------------------------------------
+
+  COMPAS Recidivism (~7K rows)
+    Protected  : race (Caucasian vs African-American)
+    Target     : recidivism within 2 years
+    Get it from: github.com/propublica/compas-analysis
+    Note: cite ProPublica analysis AND Dressel & Farid 2018 critique
+
+  Adult Income / Census (~48K rows)
+    Protected  : gender, race
+    Target     : income > $50K
+    Get it from: UCI ML Repository
+    Why first  : logistic regression gets ~0.88 AUC, results look strong,
+                 reviewers know exactly what good performance looks like
+
+  German Credit (~1K rows)
+    Protected  : age (>25 vs <=25)
+    Target     : credit risk
+    Get it from: UCI ML Repository
+    Why include: small dataset tests streaming on limited data
+
+  Home Credit (~307K rows)
+    Protected  : gender
+    Target     : loan default
+    Keep it for: large-scale result only, not primary demo dataset
+
+  Optional but strengthens case significantly:
+    CelebA (~200K face images)
+      Protected: gender
+      Target   : attractiveness or smile detection
+      Requires : MLP/CNN — demonstrates method works in vision domain
+
+------------------------------------------------------------
+3.2  Experimental Protocol (non-negotiable for top-tier)
+------------------------------------------------------------
+
+  Seeds:
+    Run every experiment with 5 different random seeds.
+    Report mean +/- standard deviation. Never report a single run.
+
+  Statistical significance:
+    Use Wilcoxon signed-rank test (non-parametric, paired) to compare methods.
+    Report p-values. Claim significance only at p < 0.05.
+    Report Cohen's d effect size alongside p-value.
+
+  Streaming protocol (apply consistently across all datasets):
+    Batches 1 to T*0.4       : clean warmup
+    Batches T*0.4 to T*0.75  : bias injection window
+    Batches T*0.75 to T      : clean recovery period
+
+    This tests three things: detection, correction, AND recovery.
+    Reviewers want to see SPD go up, get corrected, then come back down.
+
+  Metrics to report in every table:
+    AUC             primary performance metric
+    SPD             fairness (statistical parity difference)
+    EOD             fairness (equalized odds difference)
+    Violations      number of batches exceeding threshold tau
+    Unlearn events  number of triggered unlearning actions
+    Cost (ms)       wall-clock time per unlearning event
+    vs Retrain      ratio of unlearning cost to full retrain cost
+
+------------------------------------------------------------
+3.3  Ablation Study (Week 14-16)
+------------------------------------------------------------
+Remove one component at a time. Show each contributes.
+
+  AFU-full           your method, all components
+  AFU-no-cusum       simple threshold crossing instead of CUSUM
+  AFU-no-influence   random point selection instead of influence scoring
+  AFU-no-rollback    accept all unlearning even if accuracy drops
+  AFU-no-ewc         no elastic weight consolidation
+  AFU-no-replay      no replay buffer for utility preservation
+
+  Each ablation takes ~1 day to implement. Report in a single table.
+  Every component should show measurable contribution.
+
+------------------------------------------------------------
+3.4  Baselines (Week 12-18)
+------------------------------------------------------------
+Your current 3 baselines are not enough. Add:
+
+  FairBatch (Roh et al., ICLR 2021)
+    Adjusts batch sampling to satisfy fairness constraints.
+    No unlearning — fairness-aware training only.
+    Code: github.com/yuji-roh/fairbatch
+
+  SISA Training (Bourtoule et al., IEEE S&P 2021)
+    Sharded isolated sliced aggregated training for exact unlearning.
+    Achieves certified unlearning but ignores fairness.
+    Adapt it: partition replay buffer into shards, retrain affected shard.
+    Good comparison: SISA gets certified unlearning but worse fairness.
+
+  Adversarial Debiasing (Zhang et al., AIES 2018)
+    Adversarial network minimizes prediction loss while an adversary
+    tries to predict the protected attribute.
+    Shows: fairness-during-training vs fairness-via-unlearning comparison.
+
+  Keep your existing baselines:
+    PeriodicRetrainer, FairnessRegularizedSGD, StaticUnlearner
+
+================================================================================
+PHASE 4 — PAPER STRUCTURE  (Months 5-8, start writing early)
+================================================================================
+
+NeurIPS format: 9 pages main body + unlimited appendix + references
+
+  Abstract (1 paragraph)
+    Problem, gap, contribution, key numbers.
+    e.g. "We reduce SPD violations by X% in Y ms vs Z seconds for retrain."
+
+  1. Introduction (1.5 pages)
+    Concrete real-world scenario first (lending, recidivism).
+    Contributions as 4 explicit numbered bullet points.
+    Reference your own theorems by number: "We prove (Theorem 1) that..."
+
+  2. Related Work (0.75 pages)
+    Machine unlearning: Guo 2020, Sekhari 2021, Bourtoule 2021
+    Fairness in ML: Hardt 2016, Dwork 2012, Chouldechova 2017
+    Streaming fairness: cite whatever recent work exists
+    Influence functions: Koh & Liang 2017
+    Concept drift detection: CUSUM (Page 1954), ADWIN
+
+  3. Problem Formulation (0.75 pages)
+    Formal definitions. Key notation table. Main theorem stated here.
+
+  4. AFU Framework (2 pages)
+    Algorithm 1 box: full main loop pseudocode
+    Each component: detection, attribution, unlearning, preservation
+    Complexity: O(?) per batch, O(?) per unlearning event
+
+  5. Theoretical Analysis (1.5 pages)
+    Theorem 1: Certified unlearning bound (from Phase 1.2)
+    Theorem 2: Fairness recovery bound (from Phase 1.3)
+    Theorem 3: CUSUM detection delay (from Phase 1.4)
+    Proposition: Accuracy-fairness-unlearning tradeoff (from Phase 1.5)
+    Proofs go in appendix. Main text has proof sketches only.
+
+  6. Experiments (2 pages)
+    6.1 Setup: datasets, models, baselines, protocol
+    6.2 Main results: one big table, all methods x all datasets x all metrics
+    6.3 Ablation table
+    Figure 1: fairness trajectory over streaming batches (SPD vs batch)
+    Figure 2: cost comparison bar chart (unlearning vs retrain, log scale)
+    Figure 3: ablation visual
+
+  7. Conclusion (0.25 pages)
+
+  Appendix
+    A: All proofs (full detail)
+    B: Dataset statistics and preprocessing details
+    C: Full hyperparameter tables
+    D: Additional experimental results (all seeds, all metrics)
+
+  Writing tips:
+    Write theorem statements before writing proofs.
+    A clean theorem statement is worth more than a messy proof.
+    Every figure must tell exactly one story. Label axes clearly.
+    Get at least one co-author with theory experience to review proofs.
+
+================================================================================
+PHASE 5 — SUBMISSION AND REVISION  (Months 7-12)
+================================================================================
+
+  Month 7-8  : Full draft complete. Internal co-author review.
+  Month 8    : Post to arxiv for timestamp and visibility.
+  Month 8-9  : Revise from internal feedback. Proofread carefully.
+  Month 9    : Submit to target venue.
+  Month 10-11: Rebuttal period. Prepare detailed responses.
+
+  Anticipate these reviewer objections and have answers ready:
+    "Only tabular data"
+      -> Have CelebA results ready in appendix
+    "Proofs assume convexity"
+      -> Have Section 2.3 empirical gap results ready
+    "Baselines are weak"
+      -> Make sure FairBatch and SISA are in main table
+    "LiSSA approximation quality?"
+      -> Report approximation error explicitly as a metric
+
+  Month 11-12: Accept / major revision / resubmit cycle.
+
+================================================================================
+QUICK WINS — DO THESE IN MONTH 1 REGARDLESS
+================================================================================
+
+  1. Run existing code on Adult Income and COMPAS right now.
+     Both are small. Should work in under 2 hours with no code changes.
+     Preliminary results on 2 extra datasets immediately upgrades the paper.
+
+  2. Add 5-seed averaging to existing experiments.
+     Change run_demo.py to loop over [42, 0, 1, 7, 99] and report mean +/- std.
+     This is 10 lines of code and makes every result publishable-quality.
+
+  3. Make the cost comparison figure explicit.
+     You already log cost_seconds in the audit trail.
+     Plot: bar chart of [unlearning, SISA, periodic retrain] costs on log scale.
+     "2ms vs 45 seconds" is your strongest empirical claim. Make it a figure.
+
+  4. Switch primary demo dataset from Home Credit to Adult Income.
+     Logistic regression gets AUC ~0.88 on Adult. Reviewers know this dataset.
+     Results will look much stronger. Keep Home Credit as "large scale" result.
+
+================================================================================
+KEY PAPERS TO READ (priority order)
+================================================================================
+
+  Theory — read these first:
+    Guo et al. 2020
+      "Certified Data Removal from Machine Learning Models" (ICML)
+    Sekhari et al. 2021
+      "Remember What You Want to Forget: Algorithms for Machine Unlearning" (NeurIPS)
+    Neel et al. 2021
+      "Descent-to-Delete: Gradient-Based Methods for Machine Unlearning" (ALT)
+    Koh & Liang 2017
+      "Understanding Black-box Predictions via Influence Functions" (ICML)
+
+  Fairness:
+    Hardt et al. 2016
+      "Equality of Opportunity in Supervised Learning" (NeurIPS)
+    Dwork et al. 2012
+      "Fairness Through Awareness" (ITCS)
+    Chouldechova 2017
+      "Fair prediction with disparate impact: A study of bias in recidivism
+       prediction instruments" (Big Data)
+
+  Baselines to implement:
+    Roh et al. 2021 — "FairBatch" (ICLR)
+    Bourtoule et al. 2021 — "Machine Unlearning" / SISA (IEEE S&P)
+    Zhang et al. 2018 — "Mitigating Unwanted Biases with Adversarial Learning" (AIES)
+    Pruthi et al. 2020 — "Estimating Training Data Influence by Tracing
+      Gradient Descent" / TracIn (NeurIPS)
+
+  Detection theory:
+    Page 1954 — "Continuous Inspection Schemes" (original CUSUM, Biometrika)
+    Lorden 1971 — "Procedures for Reacting to a Change in Distribution"
+
+================================================================================
+SUMMARY TIMELINE
+================================================================================
+
+  Month 1    Formalize problem, start theory, run COMPAS + Adult, 5-seed averaging
+  Month 2    Complete certified unlearning proof, fairness recovery bound
+  Month 3    TracIn implementation, MLP base model working
+  Month 4    All 4 datasets running, ablation study complete
+  Month 5    All baselines implemented, main results table complete
+  Month 6    Full paper draft written
+  Month 7    Co-author review and revisions
+  Month 8    arxiv submission + venue submission
+  Month 9-12 Rebuttal and revision cycle
+
+================================================================================
+
+
+
+
+
+
+
+
+
+
+This is actually a really strong research angle — and it's timely. What you're describing has a formal name: performative prediction combined with feedback loop bias amplification. It could significantly differentiate your paper.                  
+                               
+  ---                                                                                                                                                                                                                                                    
+  The mechanism you're describing             
+                                                                                                                                                                                                                                                         
+  In deployed decision systems, the model's predictions become the training data for the next iteration:                                                                                                                                                 
+                                                                                                                                                                                                                                                         
+  Model predicts group A is high risk                                                                                                                                                                                                                    
+      -> Group A gets denied loans / flagged                                                                                                                                                                                                             
+          -> Group A has worse observed outcomes
+              -> Next model sees group A as even higher risk
+                  -> Bias compounds each iteration
+
+  This is fundamentally different from your current bias injection (manual label flipping). The bias is endogenous — generated by the model itself. It's been shown to grow monotonically without intervention.
+
+  ---
+  Why this is novel for AFU
+
+  Current AFU assumes bias arrives from outside (exogenous). No existing fairness unlearning paper formally models self-reinforcing bias from the model's own predictions. That gap is your contribution.
+
+  The theoretical claim becomes much stronger:
+
+  ▎ "Under performative feedback, SPD grows as O(t · α) without intervention, where α is the model's influence on future labels. We prove AFU bounds this growth to O(log t) by periodically breaking the feedback loop via selective unlearning."
+
+  ---
+  How to implement it
+
+  Add a FeedbackLoopStreamLoader that wraps any existing loader:
+
+  class FeedbackLoopStreamLoader:
+      """
+      Simulates a deployed model whose predictions influence future training labels.
+   
+      Mechanism:
+          At each batch, a fraction `influence_rate` of future labels are
+          replaced by the model's current predictions rather than ground truth.
+   
+          This mimics real deployment: if the model flags someone as high risk,
+          they may not receive the loan/service, so their "true" outcome is
+          never observed — the model's prediction IS the outcome.
+   
+      Bias amplification:
+          If the model is already biased (higher P(y=1|A=0) than P(y=1|A=1)),
+          the feedback loop makes group 0 look increasingly risky over time.
+          SPD grows monotonically without external intervention.
+      """
+
+      def __init__(self, base_loader, model_ref, influence_rate=0.3, seed=42):
+          self._base = base_loader
+          self._model = model_ref      # live reference — predictions change as model updates
+          self._rate = influence_rate  # fraction of labels replaced by model predictions
+          self._rng = np.random.RandomState(seed)
+
+      def stream(self, batch_size=500):
+          for batch in self._base.stream(batch_size=batch_size):
+              y_corrupted = batch.y.copy()
+
+              # For `influence_rate` fraction of samples, replace ground truth
+              # with model's current prediction (simulating "decision = outcome")
+              mask = self._rng.rand(len(batch.y)) < self._rate
+              if mask.any():
+                  model_preds = (self._model.predict(batch.X[mask]) >= 0.5).astype(int)
+                  y_corrupted[mask] = model_preds
+
+              yield DataBatch(
+                  X=batch.X, y=y_corrupted,
+                  protected=batch.protected,
+                  timestamp=batch.timestamp,
+                  indices=batch.indices,
+                  metadata={"feedback_corrupted": mask.sum(), "influence_rate": self._rate}
+              )
+
+  ---
+  The experiment this enables
+
+  Compare three conditions in your streaming setup:
+
+  ┌───────────────────────┬─────────────────────────────────────────────────┐
+  │       Condition       │          What happens to SPD over time          │
+  ├───────────────────────┼─────────────────────────────────────────────────┤
+  │ No feedback, no AFU   │ SPD stays flat (baseline)                       │
+  ├───────────────────────┼─────────────────────────────────────────────────┤
+  │ Feedback loop, no AFU │ SPD grows monotonically — proves the problem    │
+  ├───────────────────────┼─────────────────────────────────────────────────┤
+  │ Feedback loop + AFU   │ SPD growth bounded — proves AFU breaks the loop │
+  └───────────────────────┴─────────────────────────────────────────────────┘
+
+  This is a much more compelling empirical story than manual bias injection, because the bias emerges naturally from the system rather than being artificially inserted.
+
+  ---
+  Connection to the LLM model collapse literature
+
+  Shumailov et al. 2023 ("The Curse of Recursion") showed that LLMs trained recursively on AI-generated data forget the tails of distributions — minority populations progressively disappear from what the model can represent. Your work is the
+  decision-system analogue:
+
+  - LLMs: minority tokens become underrepresented in generations
+  - Decision systems: minority groups become increasingly misclassified
+
+  This connection makes your paper relevant to a much wider audience than just fairness researchers.
+
+  ---
+  New theorem it enables
+
+  Theorem (Feedback Loop Divergence without Intervention):
+  Let α be the influence rate and SPD₀ be the initial disparity. Under the feedback loop model:
+
+  E[SPD_t] >= SPD_0 * (1 + alpha)^t   [grows exponentially in t]
+
+  Corollary (AFU breaks the loop):
+  With AFU triggering every K batches when SPD > τ:
+
+  E[SPD_t] <= tau + O(K * alpha)   [bounded, independent of t]
+
+  This is a clean, provable result that directly motivates why continuous monitoring and unlearning is necessary — not just nice to have.
+
+  ---
+  Add to roadmap
+
+  This would slot into the roadmap as:
+
+  ┌────────────────────────┬──────────────────────────────────────────────────────────────────────┐
+  │         Phase          │                               Addition                               │
+  ├────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ Phase 1 theory         │ Prove feedback loop divergence theorem (2-3 weeks)                   │
+  ├────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ Phase 2 implementation │ FeedbackLoopStreamLoader (~1 day of code)                            │
+  ├────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ Phase 3 experiments    │ New experiment: feedback vs no-feedback vs AFU                       │
+  ├────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ Paper Section 3        │ Add feedback loop as the primary motivation for streaming unlearning │
+  └────────────────────────┴──────────────────────────────────────────────────────────────────────┘
+
+  Key papers to add to your reading list:
+  - Perdomo et al. 2020 — "Performative Prediction" (ICML) — the formal framework for this
+  - D'Amour et al. 2020 — "Fairness is not Static" (FAccT) — long-term fairness under feedback
+  - Shumailov et al. 2023 — "The Curse of Recursion" — model collapse from AI-generated data
+  - Hashimoto et al. 2018 — "Fairness Without Demographics in Repeated Loss Minimization" (ICML)
+
+  This angle makes AFU not just a fairness correction tool but a feedback loop prevention mechanism — which is a much stronger and more broadly relevant framing for top-tier venues.

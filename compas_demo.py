@@ -137,7 +137,20 @@ def run(csv_path: str, batch_size: int, threshold: float) -> None:
 
     X, y, protected, time_order = load_compas(csv_path)
 
-    loader = RealWorldStreamLoader(X, y, protected, time_order)
+    # Sort chronologically before splitting
+    order = np.argsort(time_order)
+    X, y, protected, time_order = X[order], y[order], protected[order], time_order[order]
+
+    # Split: first min(10%, 500) samples for pre-training, rest for streaming
+    n_pretrain = min(len(y) // 10, 500)
+    X_pre, y_pre, p_pre = X[:n_pretrain], y[:n_pretrain], protected[:n_pretrain]
+    X_stream, y_stream, p_stream = X[n_pretrain:], y[n_pretrain:], protected[n_pretrain:]
+    time_stream = time_order[n_pretrain:]
+
+    print(f"\n  Pre-training samples : {n_pretrain}")
+    print(f"  Streaming samples   : {len(y_stream)}")
+
+    loader = RealWorldStreamLoader(X_stream, y_stream, p_stream, time_stream)
 
     # COMPAS has ~5,000–7,000 rows after filtering to Black/White.
     # Use a smaller batch size and window than Home Credit accordingly.
@@ -170,8 +183,15 @@ def run(csv_path: str, batch_size: int, threshold: float) -> None:
           f"window={cfg.fairness_window_size}")
 
     # ---- AFU pipeline -------------------------------------------------------
-    print("\nRunning AFU pipeline ...")
+    print("\nPre-training on clean historical data ...")
     pipe = AdaptiveFairUnlearningPipeline(cfg)
+    pretrain_history = pipe.fit_initial(X_pre, y_pre, p_pre)
+
+    print(f"  Converged in {len(pretrain_history)} epoch(s)")
+    print(f"  Final pre-train accuracy: {pretrain_history[-1].accuracy:.4f}")
+    print(f"  Final pre-train SPD:      {pretrain_history[-1].spd:.4f}")
+
+    print("\nRunning AFU pipeline on streaming data ...")
     history, actions = pipe.run(loader.stream(batch_size=batch_size))
 
     _print_trajectory(history, n_show=20)
@@ -184,7 +204,7 @@ def run(csv_path: str, batch_size: int, threshold: float) -> None:
 
     def make_stream():
         dataclasses.replace(cfg)            # ensure fresh config copy
-        ldr = RealWorldStreamLoader(X, y, protected, time_order)
+        ldr = RealWorldStreamLoader(X_stream, y_stream, p_stream, time_stream)
         return ldr.stream(batch_size=batch_size)
 
     ev = Evaluator(cfg)

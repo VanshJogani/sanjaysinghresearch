@@ -40,6 +40,76 @@ class AdaptiveFairUnlearningPipeline:
         self.preserver = UtilityPreserver(self.model, cfg)
         self.audit = AuditLogger()
 
+    def fit_initial(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        protected: np.ndarray,
+        max_epochs: int = 10,
+        tol: float = 1e-4,
+    ) -> List[FairnessSnapshot]:
+        """
+        Pre-train the model on a static dataset before streaming begins.
+
+        Trains in mini-batches for up to `max_epochs`, stopping early if
+        the weight change between epochs falls below `tol`. Logs fairness
+        metrics each epoch (no detection triggered). Seeds the replay buffer.
+
+        Parameters
+        ----------
+        X : array of shape (n_samples, n_features)
+        y : array of shape (n_samples,)
+        protected : array of shape (n_samples,)
+        max_epochs : maximum full passes over the data
+        tol : convergence threshold on ‖Δθ‖
+
+        Returns
+        -------
+        pretrain_history : list of FairnessSnapshot (one per epoch)
+        """
+        n_samples = len(y)
+        batch_size = self.cfg.batch_size
+        pretrain_history: List[FairnessSnapshot] = []
+
+        for epoch in range(max_epochs):
+            old_params = self.model.get_params()
+
+            # Shuffle data each epoch
+            perm = self._rng.permutation(n_samples)
+            X_shuf, y_shuf, p_shuf = X[perm], y[perm], protected[perm]
+
+            # Train in mini-batches
+            for start in range(0, n_samples, batch_size):
+                end = min(start + batch_size, n_samples)
+                self.model.update(X_shuf[start:end], y_shuf[start:end])
+
+            # Log fairness metrics (no detection trigger)
+            y_pred = self.model.predict_labels(X)
+            accuracy = float((y_pred == y).mean())
+            self.monitor.update(y_pred, y, protected)
+            snapshot = self.monitor.snapshot(timestamp=-(max_epochs - epoch), accuracy=accuracy)
+            pretrain_history.append(snapshot)
+
+            # Convergence check
+            new_params = self.model.get_params()
+            param_delta = np.linalg.norm(new_params - old_params)
+            if param_delta < tol:
+                break
+
+        # Seed the replay buffer with pre-training data
+        # Add in batch-sized chunks to respect buffer structure
+        for start in range(0, n_samples, batch_size):
+            end = min(start + batch_size, n_samples)
+            pretrain_batch = DataBatch(
+                X=X[start:end],
+                y=y[start:end],
+                protected=protected[start:end],
+                timestamp=-1,
+            )
+            self.replay_buffer.add(pretrain_batch)
+
+        return pretrain_history
+
     def run(
         self,
         stream: Generator[DataBatch, None, None],

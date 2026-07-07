@@ -22,7 +22,7 @@ from adaptive_fairness_unlearning.evaluation.benchmarks import Evaluator
 # ---------------------------------------------------------------------------
 
 DRIFT_SCHEDULE = {0: 0.0, 20: 0.0, 35: 0.785}        # 45° rotation at batch 35
-BIAS_WINDOWS = [(25, 40, 0.8)]                          # strong bias injected 25–40
+BIAS_WINDOWS = [(25, 40, 3.0)]                          # strong bias injected 25–40
 
 
 def make_stream(cfg: FrameworkConfig):
@@ -35,13 +35,40 @@ def make_stream(cfg: FrameworkConfig):
 
 
 # ---------------------------------------------------------------------------
-# 1. Run AFU pipeline
+# 1. Generate clean pre-training data (no drift, no bias)
+# ---------------------------------------------------------------------------
+
+def make_pretrain_data(cfg: FrameworkConfig, n_samples: int = 500):
+    """Generate clean historical data for pre-training (no drift, no bias)."""
+    pretrain_cfg = FrameworkConfig(
+        n_features=cfg.n_features,
+        n_informative=cfg.n_informative,
+        batch_size=n_samples,
+        n_batches=1,
+        noise_std=cfg.noise_std,
+        base_protected_correlation=cfg.base_protected_correlation,
+        seed=cfg.seed + 1000,  # different seed so data isn't identical to stream
+    )
+    gen = SyntheticStreamGenerator(pretrain_cfg)
+    # Single batch, no drift, no bias injection
+    batch = next(gen.stream(drift_schedule=None, bias_injection_windows=None))
+    return batch.X, batch.y, batch.protected
+
+
+# ---------------------------------------------------------------------------
+# 2. Run AFU pipeline (with pre-training)
 # ---------------------------------------------------------------------------
 
 def run_pipeline(cfg: FrameworkConfig):
     pipe = AdaptiveFairUnlearningPipeline(cfg)
+
+    # Pre-train on clean historical data
+    X_pre, y_pre, p_pre = make_pretrain_data(cfg)
+    pretrain_history = pipe.fit_initial(X_pre, y_pre, p_pre)
+
+    # Stream the (potentially biased) data
     history, actions = pipe.run(make_stream(cfg))
-    return pipe, history, actions
+    return pipe, pretrain_history, history, actions
 
 
 # ---------------------------------------------------------------------------
@@ -108,29 +135,39 @@ def try_plot(history_dict: dict, cfg: FrameworkConfig) -> None:
     fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
     colors = {"afu": "blue", "periodic": "orange", "fairness_sgd": "green", "static": "red"}
 
-    # We only have history for AFU from the pipeline run; plot SPD/EOD/Acc
-    # For the comparison run we only stored aggregate stats, so we re-run AFU
+    # Re-run AFU with pre-training for the plot
     cfg2 = FrameworkConfig(
         n_batches=cfg.n_batches,
         batch_size=cfg.batch_size,
         seed=cfg.seed,
     )
     pipe = AdaptiveFairUnlearningPipeline(cfg2)
+    X_pre, y_pre, p_pre = make_pretrain_data(cfg2)
+    pretrain_hist = pipe.fit_initial(X_pre, y_pre, p_pre)
     hist_afu, _ = pipe.run(make_stream(cfg2))
 
-    ts = [s.timestamp for s in hist_afu]
-    axes[0].plot(ts, [s.spd for s in hist_afu], label="AFU", color=colors["afu"])
+    # Combine pre-train + stream for full timeline
+    all_hist = pretrain_hist + hist_afu
+    ts = [s.timestamp for s in all_hist]
+
+    # Mark where streaming begins
+    stream_start = hist_afu[0].timestamp if hist_afu else 0
+
+    axes[0].plot(ts, [s.spd for s in all_hist], label="AFU", color=colors["afu"])
     axes[0].axhline(cfg.fairness_threshold, color="grey", linestyle="--", label="threshold")
+    axes[0].axvline(stream_start, color="black", linestyle=":", alpha=0.5, label="stream start")
     axes[0].set_ylabel("SPD")
     axes[0].legend()
     axes[0].set_title("Statistical Parity Difference over Time")
 
-    axes[1].plot(ts, [s.eod for s in hist_afu], label="AFU", color=colors["afu"])
+    axes[1].plot(ts, [s.eod for s in all_hist], label="AFU", color=colors["afu"])
     axes[1].axhline(cfg.fairness_threshold, color="grey", linestyle="--")
+    axes[1].axvline(stream_start, color="black", linestyle=":", alpha=0.5)
     axes[1].set_ylabel("EOD")
     axes[1].set_title("Equalized Odds Difference over Time")
 
-    axes[2].plot(ts, [s.accuracy for s in hist_afu], label="AFU", color=colors["afu"])
+    axes[2].plot(ts, [s.accuracy for s in all_hist], label="AFU", color=colors["afu"])
+    axes[2].axvline(stream_start, color="black", linestyle=":", alpha=0.5)
     axes[2].set_ylabel("Accuracy")
     axes[2].set_xlabel("Batch")
     axes[2].set_title("Predictive Accuracy over Time")
@@ -153,14 +190,21 @@ def main() -> None:
         n_batches=50,
         batch_size=200,
         seed=42,
-        fairness_threshold=0.10,
-        consecutive_violations=3,
+        fairness_threshold=0.05,
+        consecutive_violations=2,
         unlearning_budget=30,
     )
 
     # --- Pipeline run -------------------------------------------------------
-    print("\nRunning AFU pipeline...")
-    pipe, history, actions = run_pipeline(cfg)
+    print("\nPre-training on 500 clean samples...")
+    pipe, pretrain_history, history, actions = run_pipeline(cfg)
+
+    print(f"  Pre-training converged in {len(pretrain_history)} epoch(s)")
+    print(f"  Final pre-train accuracy: {pretrain_history[-1].accuracy:.4f}")
+    print(f"  Final pre-train SPD:      {pretrain_history[-1].spd:.4f}")
+    print()
+
+    print("Running AFU pipeline on streaming data...")
     print_fairness_trajectory(history, n_show=15)
     print_audit_summary(actions)
 
